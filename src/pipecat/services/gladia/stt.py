@@ -252,7 +252,6 @@ class GladiaSTTService(STTService):
         self._max_reconnection_attempts = max_reconnection_attempts
         self._reconnection_delay = reconnection_delay
         self._reconnection_attempts = 0
-        self._session_url = None
         self._connection_active = False
 
         # Audio buffer management
@@ -415,15 +414,14 @@ class GladiaSTTService(STTService):
         """Handle WebSocket connection with automatic reconnection."""
         while self._should_reconnect:
             try:
-                # Initialize session if needed
-                if not self._session_url:
-                    settings = self._prepare_settings()
-                    response = await self._setup_gladia(settings)
-                    self._session_url = response["url"]
-                    self._reconnection_attempts = 0
+                # Get a fresh session URL
+                settings = self._prepare_settings()
+                response = await self._setup_gladia(settings)
+                session_url = response["url"]
+                self._reconnection_attempts = 0
 
                 # Connect with automatic reconnection
-                async with websockets.connect(self._session_url) as websocket:
+                async with websockets.connect(session_url) as websocket:
                     try:
                         self._websocket = websocket
                         self._connection_active = True
@@ -449,9 +447,13 @@ class GladiaSTTService(STTService):
                         if self._keepalive_task:
                             await self.cancel_task(self._keepalive_task)
 
-                        # Attempt reconnect using helper
-                        if not await self._maybe_reconnect():
-                            break
+                    finally:
+                        # Ensure WebSocket is fully closed and cleaned up before reconnection
+                        await self._ensure_websocket_closed()
+
+                # After WebSocket context manager exits, check if we should reconnect
+                if not await self._maybe_reconnect():
+                    break
 
             except Exception as e:
                 logger.error(f"Error in connection handler: {e}")
@@ -460,9 +462,35 @@ class GladiaSTTService(STTService):
                 if not self._should_reconnect:
                     break
 
-                # Reset session URL to get a new one
-                self._session_url = None
+                # Ensure cleanup before retry
+                await self._ensure_websocket_closed()
+
+                # Add delay before retry to prevent rate limiting
                 await asyncio.sleep(self._reconnection_delay)
+
+    async def _ensure_websocket_closed(self):
+        """Ensure WebSocket is completely closed and cleaned up."""
+        if self._websocket:
+            try:
+                if not self._websocket.closed:
+                    logger.debug("Closing WebSocket connection")
+                    # Try to send stop_recording before closing
+                    await self._send_stop_recording()
+                    # Force close with code 1000 (Normal Closure)
+                    await self._websocket.close(code=1000)
+                    # Wait for closure confirmation with timeout
+                    await asyncio.wait_for(self._websocket.wait_closed(), timeout=5.0)
+                    logger.debug("WebSocket fully closed")
+            except asyncio.TimeoutError:
+                logger.warning("WebSocket close timeout, connection may still be closing")
+            except Exception as e:
+                logger.warning(f"Error during WebSocket cleanup: {e}")
+            finally:
+                self._websocket = None
+                self._connection_active = False
+
+        # Reset connection state
+        self._connection_active = False
 
     async def _cleanup_connection(self):
         """Clean up connection resources."""
@@ -472,13 +500,11 @@ class GladiaSTTService(STTService):
             await self.cancel_task(self._keepalive_task)
             self._keepalive_task = None
 
-        if self._websocket:
-            await self._websocket.close()
-            self._websocket = None
-
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
+
+        await self._ensure_websocket_closed()
 
     async def _setup_gladia(self, settings: Dict[str, Any]):
         async with aiohttp.ClientSession() as session:
@@ -491,12 +517,20 @@ class GladiaSTTService(STTService):
                     return await response.json()
                 else:
                     error_text = await response.text()
-                    logger.error(
-                        f"Gladia error: {response.status}: {error_text or response.reason}"
-                    )
-                    raise Exception(
-                        f"Failed to initialize Gladia session: {response.status} - {error_text}"
-                    )
+                    if response.status == 429:
+                        logger.warning(f"Rate limit exceeded (429): {error_text}")
+                        # Add exponential backoff for rate limiting
+                        delay = self._reconnection_delay * (2**self._reconnection_attempts)
+                        logger.info(f"Waiting {delay} seconds before retry due to rate limit")
+                        await asyncio.sleep(delay)
+                        raise Exception(f"Rate limit exceeded: {error_text}")
+                    else:
+                        logger.error(
+                            f"Gladia error: {response.status}: {error_text or response.reason}"
+                        )
+                        raise Exception(
+                            f"Failed to initialize Gladia session: {response.status} - {error_text}"
+                        )
 
     @traced_stt
     async def _handle_transcription(
@@ -520,8 +554,15 @@ class GladiaSTTService(STTService):
                 await self._send_audio(bytes(self._audio_buffer))
 
     async def _send_stop_recording(self):
+        """Send stop recording message to Gladia to properly close the session."""
         if self._websocket and not self._websocket.closed:
-            await self._websocket.send(json.dumps({"type": "stop_recording"}))
+            try:
+                await self._websocket.send(json.dumps({"type": "stop_recording"}))
+                logger.debug("Sent stop_recording message to Gladia")
+            except websockets.exceptions.ConnectionClosed:
+                logger.debug("WebSocket already closed, cannot send stop_recording")
+            except Exception as e:
+                logger.warning(f"Error sending stop_recording message: {e}")
 
     async def _keepalive_task_handler(self):
         """Send periodic empty audio chunks to keep the connection alive."""
@@ -548,8 +589,17 @@ class GladiaSTTService(STTService):
             async for message in WatchdogAsyncIterator(self._websocket, manager=self.task_manager):
                 content = json.loads(message)
 
+                # Handle session end event from Gladia
+                if content.get("event") == "live.end_session":
+                    session_id = content.get("payload", {}).get("id", "unknown")
+                    logger.info(f"Received session end event from Gladia (session: {session_id})")
+                    self._connection_active = False
+                    # Close the connection cleanly
+                    await self._ensure_websocket_closed()
+                    break
+
                 # Handle audio chunk acknowledgments
-                if content["type"] == "audio_chunk" and content.get("acknowledged"):
+                elif content["type"] == "audio_chunk" and content.get("acknowledged"):
                     byte_range = content["data"]["byte_range"]
                     async with self._buffer_lock:
                         # Update bytes sent and trim acknowledged data from buffer
@@ -615,14 +665,21 @@ class GladiaSTTService(STTService):
         """Handle exponential backoff reconnection logic."""
         if not self._should_reconnect:
             return False
+
         self._reconnection_attempts += 1
         if self._reconnection_attempts > self._max_reconnection_attempts:
             logger.error(f"Max reconnection attempts ({self._max_reconnection_attempts}) reached")
             self._should_reconnect = False
             return False
+
         delay = self._reconnection_delay * (2 ** (self._reconnection_attempts - 1))
         logger.info(
             f"Reconnecting in {delay} seconds (attempt {self._reconnection_attempts}/{self._max_reconnection_attempts})"
         )
         await asyncio.sleep(delay)
+
+        # Add a small additional delay to ensure Gladia has processed the connection closure
+        # This helps prevent 429 errors from overlapping connections
+        await asyncio.sleep(0.5)
+
         return True
